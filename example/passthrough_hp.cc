@@ -71,6 +71,8 @@
 #include <cstdlib>
 #include "cxxopts.hpp"
 #include <mutex>
+#include <condition_variable>
+#include <chrono>
 #include <syslog.h>
 
 using namespace std;
@@ -123,6 +125,7 @@ struct OpeningFile {
 static int get_fd(fuse_file_info *fi) { return ((OpeningFile*)fi->fh)->fd; }
 struct Inode {
     int fd {-1};
+    int n_blocking_reads {0};
     dev_t src_dev {0};
     ino_t src_ino {0};
     int generation {0};
@@ -130,6 +133,8 @@ struct Inode {
     uint64_t nopen {0};
     uint64_t nlookup {0};
     std::mutex m;
+    std::condition_variable cond;
+    off_t wpos = off_t(-1);
 
     // Delete copy constructor and assignments. We could implement
     // move if we need it.
@@ -164,6 +169,8 @@ struct Fs {
     std::string fuse_mount_options;
     bool direct_io;
     bool passthrough;
+    bool trace_rw;
+    int tailing_read_timeout;
 };
 static Fs fs{};
 
@@ -995,6 +1002,11 @@ static void sfs_release(fuse_req_t req, fuse_ino_t ino, fuse_file_info *fi) {
         inode.backing_id = 0;
     }
     OpeningFile* fp = (OpeningFile*)fi->fh;
+    if (fp->is_write) {
+        inode.wpos = off_t(-1);
+        if (inode.n_blocking_reads)
+            inode.cond.notify_all();
+    }
     close(fp->fd);
     delete fp;
 
@@ -1020,15 +1032,35 @@ static void sfs_fsync(fuse_req_t req, fuse_ino_t ino, int datasync,
     fuse_reply_err(req, res == -1 ? errno : 0);
 }
 
+#define TRACE_RW_POS(...) if (fs.trace_rw) TRACE_PR_POS(__VA_ARGS__)
+#define TRACE_PR_POS(func, fx, ...) \
+    printf(func ": ino %p fd %d, size %4zd, off %zd, wpos %zd" fx "\n", \
+           fp->ino, fp->fd, size, off, fp->ino->wpos, ##__VA_ARGS__)
 
 static void do_read(fuse_req_t req, size_t size, off_t off, fuse_file_info *fi) {
 
     OpeningFile* fp = (OpeningFile*)fi->fh;
+    Inode* ino = fp->ino;
     fuse_bufvec buf = FUSE_BUFVEC_INIT(size);
     buf.buf[0].flags = static_cast<fuse_buf_flags>(
         FUSE_BUF_IS_FD | FUSE_BUF_FD_SEEK);
     buf.buf[0].fd = fp->fd;
     buf.buf[0].pos = off;
+
+    TRACE_RW_POS("do_read  ", ""); // unknown result len
+    if (off == ino->wpos && fs.tailing_read_timeout) { // tailing read
+        std::unique_lock<std::mutex> lock(ino->m);
+        ino->n_blocking_reads++;
+        if (fs.tailing_read_timeout > 0) {
+            auto has_tailing_data = [=](){ return ino->wpos != off; };
+            auto timeout = std::chrono::milliseconds(fs.tailing_read_timeout);
+            ino->cond.wait_for(lock, timeout, has_tailing_data);
+        } else {
+            ino->cond.wait(lock); // wait infinitely
+        }
+        ino->n_blocking_reads--;
+        // even wait fail, it should aslo continue
+    }
 
     fuse_reply_data(req, &buf, FUSE_BUF_COPY_FLAGS);
 }
@@ -1044,6 +1076,23 @@ static void sfs_read(fuse_req_t req, fuse_ino_t ino, size_t size, off_t off,
     do_read(req, size, off, fi);
 }
 
+static void notify_reads(OpeningFile* fp, size_t size, off_t off, ssize_t res) {
+    Inode* ino = fp->ino;
+    std::unique_lock<std::mutex> lock(ino->m);
+    if (ino->wpos == off) { // sequential write
+        //ino->wpos = off + res;
+    } else if (off_t(-1) == ino->wpos) { // first write
+        //ino->wpos = off + res;
+    } else { // random write
+        if (fs.debug)
+            TRACE_PR_POS("RANDwrite", " %zd", off + res);
+        //ino->wpos = std::max(ino->wpos, off + res); // not reasonable!
+        //ino->wpos = off + res; // respect newest write
+    }
+    ino->wpos = off + res; // update wpos
+    if (ino->n_blocking_reads)
+        ino->cond.notify_all();
+}
 
 static void do_write_buf(fuse_req_t req, size_t size, off_t off,
                          fuse_bufvec *in_buf, fuse_file_info *fi) {
@@ -1059,6 +1108,10 @@ static void do_write_buf(fuse_req_t req, size_t size, off_t off,
         fuse_reply_err(req, -res);
     else
         fuse_reply_write(req, (size_t)res);
+
+    TRACE_RW_POS("write_buf", " %zd", off + res);
+    if (res > 0 && fs.tailing_read_timeout)
+        notify_reads(fp, size, off, res);
 }
 
 
@@ -1325,6 +1378,11 @@ static cxxopts::ParseResult parse_options(int argc, char **argv) {
               "you are doing)", cxxopts::value(mount_options))
         ("num-threads", "Number of libfuse worker threads",
                         cxxopts::value<int>()->default_value(SFS_DEFAULT_THREADS))
+        ("trace-rw", "trace print read write")
+        ("tailing-read-timeout",
+            "In milliseconds, default 3000:"
+            " If readers tailing on a writing file, blocking read requests such time",
+                        cxxopts::value<int>()->default_value("3000"))
         ("clone-fd", "use separate fuse device fd for each thread")
         ("direct-io", "enable fuse kernel internal direct-io");
 
@@ -1359,6 +1417,14 @@ static cxxopts::ParseResult parse_options(int argc, char **argv) {
     fs.num_threads = options["num-threads"].as<int>();
     fs.clone_fd = options.count("clone-fd");
     fs.direct_io = options.count("direct-io");
+    fs.trace_rw = options.count("trace-rw");
+    fs.tailing_read_timeout = options["tailing-read-timeout"].as<int>();
+    if (fs.direct_io == false && fs.tailing_read_timeout) {
+        fs.direct_io = true;
+        fprintf(stderr,
+            "WARN: tailing_read_timeout = %d is not 0, auto set direct_io",
+            fs.tailing_read_timeout);
+    }
     char* resolved_path = realpath(argv[1], NULL);
     if (resolved_path == NULL)
         warn("WARNING: realpath() failed with");
