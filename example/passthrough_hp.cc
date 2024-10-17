@@ -115,6 +115,12 @@ namespace std {
 // Maps files in the source directory tree to inodes
 typedef std::unordered_map<SrcId, Inode> InodeMap;
 
+struct OpeningFile {
+    Inode* ino;
+    int fd;
+    bool is_write;
+};
+static int get_fd(fuse_file_info *fi) { return ((OpeningFile*)fi->fh)->fd; }
 struct Inode {
     int fd {-1};
     dev_t src_dev {0};
@@ -229,7 +235,7 @@ static void sfs_init(void *userdata, fuse_conn_info *conn) {
 static void sfs_getattr(fuse_req_t req, fuse_ino_t ino, fuse_file_info *fi)
 {
     struct stat attr;
-    int fd = fi ? fi->fh : get_inode(ino).fd;
+    int fd = fi ? get_fd(fi) : get_inode(ino).fd;
 
     auto res = fstatat(fd, "", &attr, AT_EMPTY_PATH | AT_SYMLINK_NOFOLLOW);
     if (res == -1) {
@@ -248,7 +254,7 @@ static void do_setattr(fuse_req_t req, fuse_ino_t ino, struct stat *attr,
 
     if (valid & FUSE_SET_ATTR_MODE) {
         if (fi) {
-            res = fchmod(fi->fh, attr->st_mode);
+            res = fchmod(get_fd(fi), attr->st_mode);
         } else {
             char procname[64];
             sprintf(procname, "/proc/self/fd/%i", ifd);
@@ -267,7 +273,7 @@ static void do_setattr(fuse_req_t req, fuse_ino_t ino, struct stat *attr,
     }
     if (valid & FUSE_SET_ATTR_SIZE) {
         if (fi) {
-            res = ftruncate(fi->fh, attr->st_size);
+            res = ftruncate(get_fd(fi), attr->st_size);
         } else {
             char procname[64];
             sprintf(procname, "/proc/self/fd/%i", ifd);
@@ -295,7 +301,7 @@ static void do_setattr(fuse_req_t req, fuse_ino_t ino, struct stat *attr,
             tv[1] = attr->st_mtim;
 
         if (fi)
-            res = futimens(fi->fh, tv);
+            res = futimens(get_fd(fi), tv);
         else {
 #ifdef HAVE_UTIMENSAT
             char procname[64];
@@ -890,7 +896,6 @@ static void sfs_create(fuse_req_t req, fuse_ino_t parent, const char *name,
         return;
     }
 
-    fi->fh = fd;
     fuse_entry_param e;
     auto err = do_lookup(parent, name, &e);
     if (err) {
@@ -901,6 +906,8 @@ static void sfs_create(fuse_req_t req, fuse_ino_t parent, const char *name,
     }
 
     Inode& inode = get_inode(e.ino);
+    OpeningFile* fp = new OpeningFile{&inode, fd, true};
+    fi->fh = uint64_t(fp);
     lock_guard<mutex> g {inode.m};
     inode.nopen++;
 
@@ -962,7 +969,9 @@ static void sfs_open(fuse_req_t req, fuse_ino_t ino, fuse_file_info *fi) {
 
     sfs_create_open_flags(fi);
 
-    fi->fh = fd;
+    bool is_write = (fi->flags & O_ACCMODE) != O_RDONLY || fi->flags & O_APPEND;
+    OpeningFile* fp = new OpeningFile{&inode, fd, is_write};
+    fi->fh = uint64_t(fp);
     if (fs.passthrough)
         do_passthrough_open(req, ino, fd, fi);
     fuse_reply_open(req, fi);
@@ -985,15 +994,17 @@ static void sfs_release(fuse_req_t req, fuse_ino_t ino, fuse_file_info *fi) {
         }
         inode.backing_id = 0;
     }
+    OpeningFile* fp = (OpeningFile*)fi->fh;
+    close(fp->fd);
+    delete fp;
 
-    close(fi->fh);
     fuse_reply_err(req, 0);
 }
 
 
 static void sfs_flush(fuse_req_t req, fuse_ino_t ino, fuse_file_info *fi) {
     (void) ino;
-    auto res = close(dup(fi->fh));
+    auto res = close(dup(get_fd(fi)));
     fuse_reply_err(req, res == -1 ? errno : 0);
 }
 
@@ -1003,19 +1014,20 @@ static void sfs_fsync(fuse_req_t req, fuse_ino_t ino, int datasync,
     (void) ino;
     int res;
     if (datasync)
-        res = fdatasync(fi->fh);
+        res = fdatasync(get_fd(fi));
     else
-        res = fsync(fi->fh);
+        res = fsync(get_fd(fi));
     fuse_reply_err(req, res == -1 ? errno : 0);
 }
 
 
 static void do_read(fuse_req_t req, size_t size, off_t off, fuse_file_info *fi) {
 
+    OpeningFile* fp = (OpeningFile*)fi->fh;
     fuse_bufvec buf = FUSE_BUFVEC_INIT(size);
     buf.buf[0].flags = static_cast<fuse_buf_flags>(
         FUSE_BUF_IS_FD | FUSE_BUF_FD_SEEK);
-    buf.buf[0].fd = fi->fh;
+    buf.buf[0].fd = fp->fd;
     buf.buf[0].pos = off;
 
     fuse_reply_data(req, &buf, FUSE_BUF_COPY_FLAGS);
@@ -1035,10 +1047,11 @@ static void sfs_read(fuse_req_t req, fuse_ino_t ino, size_t size, off_t off,
 
 static void do_write_buf(fuse_req_t req, size_t size, off_t off,
                          fuse_bufvec *in_buf, fuse_file_info *fi) {
+    OpeningFile* fp = (OpeningFile*)fi->fh;
     fuse_bufvec out_buf = FUSE_BUFVEC_INIT(size);
     out_buf.buf[0].flags = static_cast<fuse_buf_flags>(
         FUSE_BUF_IS_FD | FUSE_BUF_FD_SEEK);
-    out_buf.buf[0].fd = fi->fh;
+    out_buf.buf[0].fd = fp->fd;
     out_buf.buf[0].pos = off;
 
     auto res = fuse_buf_copy(&out_buf, in_buf, FUSE_BUF_COPY_FLAGS);
@@ -1082,7 +1095,7 @@ static void sfs_fallocate(fuse_req_t req, fuse_ino_t ino, int mode,
         return;
     }
 
-    auto err = posix_fallocate(fi->fh, offset, length);
+    auto err = posix_fallocate(get_fd(fi), offset, length);
     fuse_reply_err(req, err);
 }
 #endif
@@ -1090,7 +1103,7 @@ static void sfs_fallocate(fuse_req_t req, fuse_ino_t ino, int mode,
 static void sfs_flock(fuse_req_t req, fuse_ino_t ino, fuse_file_info *fi,
                       int op) {
     (void) ino;
-    auto res = flock(fi->fh, op);
+    auto res = flock(get_fd(fi), op);
     fuse_reply_err(req, res == -1 ? errno : 0);
 }
 
@@ -1454,7 +1467,7 @@ int main(int argc, char *argv[]) {
         fuse_loop_cfg_set_max_threads(loop_config, fs.num_threads);
 
     fuse_loop_cfg_set_clone_fd(loop_config, fs.clone_fd);
-	
+
     if (fuse_session_mount(se, argv[2]) != 0)
         goto err_out3;
 
